@@ -5,7 +5,7 @@
 //  - Enviar frames (20ms) como Int16 via WebSocket para o backend
 
 (function () {
-	const DEFAULT_WS_URL = 'wss://SEU_BACKEND/ws/ingest';
+	const DEFAULT_WS_URL = 'wss://backend-analysis-production-a688.up.railway.app/egress-audio';
 	const DEFAULT_SAMPLE_RATE = 16000; // recomendado
 	const FRAME_MS = 20; // 20ms
 

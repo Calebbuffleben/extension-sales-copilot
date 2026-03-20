@@ -1,5 +1,5 @@
 {
-  "BACKEND_WS_BASE": "localhost:3001",
+  "BACKEND_WS_BASE": "wss://backend-analysis-production-a688.up.railway.app",
   "EGRESS_AUDIO_PATH": "/egress-audio",
   "DEFAULT_SAMPLE_RATE": 16000,
   "DEFAULT_CHANNELS": 1,
