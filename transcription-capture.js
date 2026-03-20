@@ -1,5 +1,6 @@
 // Script para capturar transcrições do Google Meet
 (function () {
+	// TODO: (Flow) Caption-based transcription ingestion is currently not used in the main pipeline (audio → Whisper). Keep only if you want to ingest Meet captions via `/egress-transcription`.
 	const DEFAULT_WS_URL = 'wss://backend-analysis-production-a688.up.railway.app/egress-transcription';
 	const POLL_INTERVAL_MS = 1000; // Verificar a cada 1 segundo
 

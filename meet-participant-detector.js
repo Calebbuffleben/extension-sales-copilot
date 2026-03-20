@@ -11,6 +11,9 @@
 	// Track to participant mapping: trackId -> participantId
 	const trackToParticipant = new Map();
 	
+	// Stream to participant mapping: streamId -> participantId (for grouping tracks from same stream)
+	const streamToParticipant = new Map();
+	
 	// Pending tracks waiting for participant assignment
 	const pendingTracks = new Map(); // trackId -> { timestamp, trackLabel, streamId }
 
@@ -264,8 +267,47 @@
 		// No match yet, add to pending
 		console.log(`[participant-detector] Track ${trackId} pending assignment`);
 		
-		// Immediately assign unique fallback ID using trackId to ensure uniqueness
-		const fallbackId = `participant-${trackId.substring(0, 8)}`;
+		// Strategy: Group tracks by streamId or timing to avoid creating multiple participants for same person
+		const TIMING_GROUP_WINDOW_MS = 500; // Group tracks within 500ms as same participant
+		let groupedParticipantId = null;
+		
+		// Try to group with other pending tracks by streamId or timing
+		for (const [pendingTrackId, pendingInfo] of pendingTracks.entries()) {
+			// Group by same streamId
+			if (streamId && pendingInfo.streamId === streamId) {
+				groupedParticipantId = pendingInfo.fallbackId;
+				console.log(`[participant-detector] 🔗 Grouping track ${trackId} with ${pendingTrackId} by streamId: ${streamId} → ${groupedParticipantId}`);
+				break;
+			}
+			// Group by timing (tracks arriving close together likely belong to same participant)
+			const timeDiff = Math.abs(timestamp - pendingInfo.timestamp);
+			if (timeDiff < TIMING_GROUP_WINDOW_MS && pendingInfo.fallbackId) {
+				groupedParticipantId = pendingInfo.fallbackId;
+				console.log(`[participant-detector] 🔗 Grouping track ${trackId} with ${pendingTrackId} by timing (timeDiff: ${timeDiff}ms) → ${groupedParticipantId}`);
+				break;
+			}
+		}
+		
+		// If only one participant is known, assign all pending tracks to them
+		if (!groupedParticipantId && participantsRegistry.size === 1) {
+			const singleParticipantId = participantsRegistry.keys().next().value;
+			console.log(`[participant-detector] 💡 Only one participant known, assigning track ${trackId} to ${singleParticipantId}`);
+			trackToParticipant.set(trackId, singleParticipantId);
+			window.postMessage(
+				{
+					type: 'TRACK_PARTICIPANT_MAPPED',
+					trackId,
+					participantId: singleParticipantId,
+					participantName: participantsRegistry.get(singleParticipantId)?.name,
+					timestamp: Date.now(),
+				},
+				'*',
+			);
+			return;
+		}
+		
+		// Create fallback ID (grouped if available, otherwise create new unique)
+		const fallbackId = groupedParticipantId || `participant-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`;
 		
 		pendingTracks.set(trackId, { timestamp, trackLabel, streamId, fallbackId });
 		

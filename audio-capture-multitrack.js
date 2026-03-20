@@ -1,9 +1,9 @@
 // Multi-Track Audio Capture for Google Meet
-// Captures and processes multiple participant audio streams simultaneously
-// Each remote WebRTC track is processed independently
+// Captures and mixes ALL participant audio tracks into a SINGLE stream
+// ONE processor, ONE WebSocket connection
 
 (function () {
-	console.log('[audio-capture-mt] Initializing multi-track audio capture');
+	console.log('[audio-capture-mt] Initializing unified audio capture');
 
 	const DEFAULT_SAMPLE_RATE = 16000;
 	const FRAME_MS = 20;
@@ -12,11 +12,18 @@
 	let _tabId = null;
 	let _meetingId = null;
 	let _wsBaseUrl = null;
+	let _sharedWebSocketReady = false;
 
-	// Participant audio processors: participantId -> ProcessorState
-	const audioProcessors = new Map();
+	// Track registry: trackId -> { track, sourceNode } (to prevent duplicate processing)
+	const activeTracks = new Map();
+	
+	// Shared WebSocket connection (ONE connection for all tracks)
+	let _sharedWebSocketUrl = null;
 
-	// Inline worklet code with detailed debugging
+	// Unified audio processor (ONE processor for ALL tracks)
+	let unifiedProcessor = null;
+
+	// Inline worklet code
 	const WORKLET_INLINE_CODE = [
 		'class MonoCaptureProcessor extends AudioWorkletProcessor {',
 		'  constructor(){ super(); this._processCount = 0; this._lastLog = 0; this._nonZeroCount = 0; }',
@@ -63,39 +70,31 @@
 		'registerProcessor("mono-capture", MonoCaptureProcessor);',
 	].join('\n');
 
-	// Processor state for one participant
-	class ParticipantAudioProcessor {
-		constructor(participantId, participantName, track, targetSampleRate) {
-			this.participantId = participantId;
-			this.participantName = participantName || participantId;
-			this.track = track;
+	// Unified audio processor - mixes ALL tracks into ONE stream
+	class UnifiedAudioProcessor {
+		constructor(targetSampleRate) {
 			this.targetSampleRate = targetSampleRate;
-			
 			this.audioContext = null;
-			this.sourceNode = null;
+			this.mixerNode = null; // GainNode used as mixer
 			this.workletNode = null;
-			this.gainNode = null;
-			this.stream = null;
+			this.outputGainNode = null;
 			this.bufferQueue = new Float32Array(0);
 			this.bytesSent = 0;
 			this.isRunning = false;
 			this.workletLoaded = false;
+			this.frameSamples = Math.round((targetSampleRate * FRAME_MS) / 1000);
+			this.sourceNodes = new Map(); // trackId -> sourceNode
 
-			console.log(`[audio-capture-mt] Created processor for ${this.participantId} (${this.participantName})`);
+			console.log('[audio-capture-mt] Created unified audio processor');
 		}
 
 		async start() {
 			if (this.isRunning) {
-				console.warn(`[audio-capture-mt] Processor already running for ${this.participantId}`);
+				console.warn('[audio-capture-mt] Unified processor already running');
 				return;
 			}
 
 			try {
-				console.log(`[audio-capture-mt] Starting processor for ${this.participantId}`);
-
-				// Create stream from track
-				this.stream = new MediaStream([this.track]);
-
 				// Create AudioContext
 				try {
 					this.audioContext = new (window.AudioContext || window.webkitAudioContext)({
@@ -106,9 +105,9 @@
 				}
 
 				const actualRate = this.audioContext.sampleRate;
-				const frameSamples = Math.round((this.targetSampleRate * FRAME_MS) / 1000);
+				this.frameSamples = Math.round((this.targetSampleRate * FRAME_MS) / 1000);
 
-				console.log(`[audio-capture-mt] ${this.participantId}: AudioContext created`, {
+				console.log('[audio-capture-mt] Unified AudioContext created', {
 					targetRate: this.targetSampleRate,
 					actualRate,
 					state: this.audioContext.state,
@@ -119,26 +118,34 @@
 					await this.audioContext.resume();
 				}
 
-				// Create source from stream
-				this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
-				this.gainNode = this.audioContext.createGain();
-				this.gainNode.gain.value = 0; // Silent output (no echo)
+				// Create mixer node (GainNode acts as mixer when multiple sources connect to it)
+				this.mixerNode = this.audioContext.createGain();
+				this.mixerNode.gain.value = 1.0; // Full gain for mixing
+
+				// Create output gain (silent, prevents echo)
+				this.outputGainNode = this.audioContext.createGain();
+				this.outputGainNode.gain.value = 0; // Silent output
 
 				// Setup AudioWorklet
-				await this.setupWorklet(actualRate, frameSamples);
+				await this.setupWorklet(actualRate);
 
-				// Open WebSocket for this participant
-				this.openWebSocket();
+				// Connect mixer -> worklet -> output gain -> destination
+				this.mixerNode.connect(this.workletNode);
+				this.workletNode.connect(this.outputGainNode);
+				this.outputGainNode.connect(this.audioContext.destination);
+
+				// Ensure shared WebSocket is open
+				ensureSharedWebSocketConnection();
 
 				this.isRunning = true;
-				console.log(`[audio-capture-mt] ✅ ${this.participantId} processor started`);
+				console.log('[audio-capture-mt] ✅ Unified processor started');
 			} catch (e) {
-				console.error(`[audio-capture-mt] Failed to start processor for ${this.participantId}:`, e);
+				console.error('[audio-capture-mt] Failed to start unified processor:', e);
 				this.stop();
 			}
 		}
 
-		async setupWorklet(actualRate, frameSamples) {
+		async setupWorklet(actualRate) {
 			try {
 				// Load worklet module
 				if (!this.workletLoaded) {
@@ -155,110 +162,144 @@
 				// Create worklet node
 				this.workletNode = new AudioWorkletNode(this.audioContext, 'mono-capture');
 
-			// Handle messages from worklet
-			this.workletNode.port.onmessage = (ev) => {
-				try {
-					const data = ev.data;
-					
-					// Handle debug messages
-					if (data && typeof data === 'object' && data.type === 'debug') {
-						console.log(`[audio-capture-mt] ${this.participantId} WORKLET DEBUG:`, data.msg, `count=${data.count}`);
-						return;
+				// Handle messages from worklet
+				this.workletNode.port.onmessage = (ev) => {
+					try {
+						const data = ev.data;
+						
+						// Handle debug messages
+						if (data && typeof data === 'object' && data.type === 'debug') {
+							console.log('[audio-capture-mt] WORKLET DEBUG:', data.msg, `count=${data.count}`);
+							return;
+						}
+						
+						// Handle stats messages
+						if (data && typeof data === 'object' && data.type === 'stats') {
+							console.log('[audio-capture-mt] AUDIO STATS:', {
+								hasAudio: data.hasAudio,
+								maxAbs: data.maxAbs?.toFixed(6),
+								processCount: data.processCount,
+								nonZeroCount: data.nonZeroCount,
+								channels: data.channels,
+								samplesPerBlock: data.len,
+								activeTracks: this.sourceNodes.size
+							});
+							return;
+						}
+						
+						// Handle audio data
+						const ab = (data && data.type === 'audio') ? data.buffer : data;
+						const block = ab instanceof ArrayBuffer ? new Float32Array(ab) : new Float32Array(0);
+						if (block.length === 0) return;
+
+						// Resample if needed
+						const resampled = this.resampleFloat32(block, actualRate, this.targetSampleRate);
+
+						// Queue
+						if (this.bufferQueue.length === 0) {
+							this.bufferQueue = resampled;
+						} else {
+							const merged = new Float32Array(this.bufferQueue.length + resampled.length);
+							merged.set(this.bufferQueue, 0);
+							merged.set(resampled, this.bufferQueue.length);
+							this.bufferQueue = merged;
+						}
+
+						// Send frames
+						let offset = 0;
+						while (this.bufferQueue.length - offset >= this.frameSamples) {
+							const frame = this.bufferQueue.subarray(offset, offset + this.frameSamples);
+							const pcm = this.floatTo16BitPCM(frame);
+							this.sendPCM(pcm);
+							offset += this.frameSamples;
+							this.bytesSent += pcm.byteLength || 0;
+						}
+
+						// Keep remainder
+						if (offset > 0) {
+							this.bufferQueue = this.bufferQueue.slice(offset);
+						}
+					} catch (e) {
+						console.error('[audio-capture-mt] Worklet message handler error:', e);
 					}
-					
-					// Handle stats messages
-					if (data && typeof data === 'object' && data.type === 'stats') {
-						console.log(`[audio-capture-mt] ${this.participantId} AUDIO STATS:`, {
-							hasAudio: data.hasAudio,
-							maxAbs: data.maxAbs?.toFixed(6),
-							processCount: data.processCount,
-							nonZeroCount: data.nonZeroCount,
-							channels: data.channels,
-							samplesPerBlock: data.len
-						});
-						return;
-					}
-					
-					// Handle audio data
-					const ab = (data && data.type === 'audio') ? data.buffer : data;
-					const block = ab instanceof ArrayBuffer ? new Float32Array(ab) : new Float32Array(0);
-					if (block.length === 0) return;
+				};
 
-					// Resample if needed
-					const resampled = this.resampleFloat32(block, actualRate, this.targetSampleRate);
-
-					// Queue
-					if (this.bufferQueue.length === 0) {
-						this.bufferQueue = resampled;
-					} else {
-						const merged = new Float32Array(this.bufferQueue.length + resampled.length);
-						merged.set(this.bufferQueue, 0);
-						merged.set(resampled, this.bufferQueue.length);
-						this.bufferQueue = merged;
-					}
-
-					// Send frames
-					let offset = 0;
-					while (this.bufferQueue.length - offset >= frameSamples) {
-						const frame = this.bufferQueue.subarray(offset, offset + frameSamples);
-						const pcm = this.floatTo16BitPCM(frame);
-						this.sendPCM(pcm);
-						offset += frameSamples;
-						this.bytesSent += pcm.byteLength || 0;
-					}
-
-					// Keep remainder
-					if (offset > 0) {
-						this.bufferQueue = this.bufferQueue.slice(offset);
-					}
-				} catch (_e) {}
-			};
-
-				// Connect audio graph
-				this.sourceNode.connect(this.workletNode);
-				this.workletNode.connect(this.gainNode);
-				this.gainNode.connect(this.audioContext.destination);
-
-				console.log(`[audio-capture-mt] ${this.participantId}: Worklet setup complete`);
+				console.log('[audio-capture-mt] Worklet setup complete');
 			} catch (e) {
-				console.error(`[audio-capture-mt] ${this.participantId}: Worklet setup failed:`, e);
+				console.error('[audio-capture-mt] Worklet setup failed:', e);
 				throw e;
 			}
 		}
 
-	floatTo16BitPCM(float32) {
-		const len = float32.length;
-		const out = new Int16Array(len);
-		
-		// Find peak amplitude for normalization
-		let peak = 0;
-		for (let i = 0; i < len; i++) {
-			const abs = Math.abs(float32[i]);
-			if (abs > peak) peak = abs;
-		}
-		
-		// Apply aggressive auto-gain for quiet signals
-		// Target: normalize quiet signals to 0.7 (higher than before)
-		let gain = 1.0;
-		if (peak > 0.00001 && peak < 0.3) {
-			// Amplify by up to 50x for very quiet signals
-			// This will bring even -60 dBFS signals up to usable levels
-			gain = Math.min(50.0, 0.7 / peak);
-			if (!this._lastGainLog || Date.now() - this._lastGainLog > 5000) {
-				console.log(`[audio-capture-mt] ${this.participantId} AUTO-GAIN: ${gain.toFixed(2)}x (peak was ${peak.toFixed(6)})`);
-				this._lastGainLog = Date.now();
+		addTrack(trackId, track) {
+			if (!this.isRunning) {
+				console.warn('[audio-capture-mt] Cannot add track: processor not running');
+				return false;
+			}
+
+			if (this.sourceNodes.has(trackId)) {
+				console.warn(`[audio-capture-mt] Track ${trackId} already added`);
+				return false;
+			}
+
+			try {
+				// Create stream from track
+				const stream = new MediaStream([track]);
+
+				// Create source node
+				const sourceNode = this.audioContext.createMediaStreamSource(stream);
+
+				// Connect source -> mixer (all tracks mix together)
+				sourceNode.connect(this.mixerNode);
+
+				this.sourceNodes.set(trackId, sourceNode);
+				console.log(`[audio-capture-mt] ✅ Added track ${trackId} to unified processor (total tracks: ${this.sourceNodes.size})`);
+				return true;
+			} catch (e) {
+				console.error(`[audio-capture-mt] Failed to add track ${trackId}:`, e);
+				return false;
 			}
 		}
-		
-		// Convert to 16-bit PCM with gain applied
-		for (let i = 0; i < len; i++) {
-			let s = float32[i] * gain;
-			if (s > 1) s = 1;
-			else if (s < -1) s = -1;
-			out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+
+		removeTrack(trackId) {
+			const sourceNode = this.sourceNodes.get(trackId);
+			if (sourceNode) {
+				try {
+					sourceNode.disconnect();
+					this.sourceNodes.delete(trackId);
+					console.log(`[audio-capture-mt] ✅ Removed track ${trackId} from unified processor (remaining tracks: ${this.sourceNodes.size})`);
+				} catch (e) {
+					console.error(`[audio-capture-mt] Error removing track ${trackId}:`, e);
+				}
+			}
 		}
-		return out.buffer;
-	}
+
+		floatTo16BitPCM(float32) {
+			const len = float32.length;
+			const out = new Int16Array(len);
+			
+			// Find peak amplitude for normalization
+			let peak = 0;
+			for (let i = 0; i < len; i++) {
+				const abs = Math.abs(float32[i]);
+				if (abs > peak) peak = abs;
+			}
+			
+			// Apply auto-gain for quiet signals
+			let gain = 1.0;
+			if (peak > 0.00001 && peak < 0.3) {
+				gain = Math.min(50.0, 0.7 / peak);
+			}
+			
+			// Convert to 16-bit PCM with gain applied
+			for (let i = 0; i < len; i++) {
+				let s = float32[i] * gain;
+				if (s > 1) s = 1;
+				else if (s < -1) s = -1;
+				out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+			}
+			return out.buffer;
+		}
 
 		resampleFloat32(buffer, sourceRate, targetRate) {
 			if (sourceRate === targetRate) return buffer;
@@ -282,88 +323,66 @@
 			return result;
 		}
 
-		openWebSocket() {
-			if (!_wsBaseUrl || !_meetingId) {
-				console.error(`[audio-capture-mt] Missing wsBaseUrl or meetingId`);
-				return;
-			}
-
-			// Build URL with participant info
-			// Parse base URL and add parameters correctly
-			const baseUrl = new URL(_wsBaseUrl);
-			baseUrl.searchParams.set('room', _meetingId);
-			baseUrl.searchParams.set('meetingId', _meetingId);
-			baseUrl.searchParams.set('participant', this.participantId);
-			baseUrl.searchParams.set('source', 'browser');
-			baseUrl.searchParams.set('track', 'webrtc-audio');
-			baseUrl.searchParams.set('sampleRate', String(this.targetSampleRate));
-			baseUrl.searchParams.set('channels', '1');
-			
-			const url = baseUrl.toString();
-			console.log(`[audio-capture-mt] ${this.participantId}: Opening WebSocket:`, url);
-
-			window.postMessage(
-				{
-					type: 'AUDIO_WS_OPEN',
-					url,
-					tabId: _tabId,
-					participantId: this.participantId,
-				},
-				'*',
-			);
-		}
-
 		sendPCM(buffer) {
 			const ab = buffer instanceof ArrayBuffer ? buffer : buffer.buffer;
 			
 			if (this.bytesSent % 64000 < 1280) {
-				console.log(`[audio-capture-mt] ${this.participantId}: sendPCM`, {
+				console.log('[audio-capture-mt] sendPCM', {
 					byteLength: ab.byteLength,
 					bytesSent: this.bytesSent,
+					activeTracks: this.sourceNodes.size
 				});
 			}
 
+			// Send through shared WebSocket connection
 			window.postMessage(
 				{
 					type: 'AUDIO_WS_SEND',
 					buffer: ab,
 					tabId: _tabId,
-					participantId: this.participantId,
+					participantId: null, // Unified stream, no participant ID
 				},
 				'*',
 			);
 		}
 
 		stop() {
-			console.log(`[audio-capture-mt] Stopping processor for ${this.participantId}`);
+			console.log('[audio-capture-mt] Stopping unified processor');
 
 			try {
+				// Disconnect all source nodes
+				for (const [trackId, sourceNode] of this.sourceNodes.entries()) {
+					try {
+						sourceNode.disconnect();
+					} catch (_e) {}
+				}
+				this.sourceNodes.clear();
+
 				if (this.workletNode) {
 					this.workletNode.port.onmessage = null;
 					this.workletNode.disconnect();
 				}
-				if (this.sourceNode) this.sourceNode.disconnect();
-				if (this.gainNode) this.gainNode.disconnect();
+				if (this.mixerNode) this.mixerNode.disconnect();
+				if (this.outputGainNode) this.outputGainNode.disconnect();
 				if (this.audioContext) this.audioContext.close();
 
-				// Close WebSocket
+				// Close shared WebSocket
 				window.postMessage(
 					{
 						type: 'AUDIO_WS_CLOSE',
 						tabId: _tabId,
-						participantId: this.participantId,
+						participantId: null,
 					},
 					'*',
 				);
 			} catch (e) {
-				console.error(`[audio-capture-mt] Error stopping ${this.participantId}:`, e);
+				console.error('[audio-capture-mt] Error stopping unified processor:', e);
 			} finally {
 				this.isRunning = false;
 				this.audioContext = null;
-				this.sourceNode = null;
+				this.mixerNode = null;
 				this.workletNode = null;
-				this.gainNode = null;
-				this.stream = null;
+				this.outputGainNode = null;
 			}
 		}
 	}
@@ -373,16 +392,22 @@
 		if (event.source !== window) return;
 		const data = event.data || {};
 
-		// When a track is mapped to a participant, start processing
+		// When a track is mapped, add it to unified processor
 		if (data.type === 'TRACK_PARTICIPANT_MAPPED') {
 			const { trackId, participantId, participantName } = data;
 			console.log(`[audio-capture-mt] Track mapped:`, { trackId, participantId, participantName });
+
+			// Check if this track is already being processed
+			if (activeTracks.has(trackId)) {
+				console.warn(`[audio-capture-mt] Track ${trackId} already being processed, skipping duplicate`);
+				return;
+			}
 
 			// Get the track from webrtc-interceptor registry
 			if (window.__webrtcInterceptor) {
 				const trackInfo = window.__webrtcInterceptor.tracksRegistry.get(trackId);
 				if (trackInfo && trackInfo.track) {
-					handleRemoteTrack(participantId, participantName, trackInfo.track);
+					handleRemoteTrack(trackId, trackInfo.track);
 				} else {
 					console.error(`[audio-capture-mt] Track ${trackId} not found in registry`);
 				}
@@ -393,14 +418,12 @@
 		if (data.type === 'WEBRTC_TRACK_REMOVED') {
 			const { trackId } = data;
 			
-			// Find which participant this track belongs to
-			for (const [participantId, processor] of audioProcessors.entries()) {
-				if (processor.track.id === trackId) {
-					console.log(`[audio-capture-mt] Removing processor for ${participantId}`);
-					processor.stop();
-					audioProcessors.delete(participantId);
-					break;
+			if (activeTracks.has(trackId)) {
+				console.log(`[audio-capture-mt] Removing track ${trackId} from unified processor`);
+				if (unifiedProcessor) {
+					unifiedProcessor.removeTrack(trackId);
 				}
+				activeTracks.delete(trackId);
 			}
 		}
 
@@ -408,16 +431,21 @@
 		if (data.type === 'AUDIO_CAPTURE_START_MULTITRACK') {
 			const payload = data.payload || {};
 			const { tabId, meetingId, wsUrl, sampleRate } = payload;
-			console.log('[audio-capture-mt] Starting multi-track capture', { tabId, meetingId, wsUrl });
+			console.log('[audio-capture-mt] Starting unified audio capture', { tabId, meetingId, wsUrl });
 
 			_tabId = tabId;
 			_meetingId = meetingId;
 			_wsBaseUrl = wsUrl;
 
+			// Create unified processor
+			unifiedProcessor = new UnifiedAudioProcessor(DEFAULT_SAMPLE_RATE);
+			unifiedProcessor.start().catch(e => {
+				console.error('[audio-capture-mt] Failed to start unified processor:', e);
+			});
+
 			console.log('[audio-capture-mt] ✅ Ready to capture tracks');
 			
-			// IMPORTANT: Check for tracks that were already captured before we initialized
-			// This handles the case where interceptor captured tracks before multi-track system started
+			// Check for tracks that were already captured before we initialized
 			if (window.__webrtcInterceptor && window.__webrtcInterceptor.tracksRegistry) {
 				const existingTracks = window.__webrtcInterceptor.tracksRegistry;
 				console.log(`[audio-capture-mt] Found ${existingTracks.size} existing tracks, processing retroactively`);
@@ -441,48 +469,84 @@
 
 		// Stop all
 		if (data.type === 'AUDIO_CAPTURE_STOP_MULTITRACK') {
-			console.log('[audio-capture-mt] Stopping all processors');
-			for (const processor of audioProcessors.values()) {
-				processor.stop();
+			console.log('[audio-capture-mt] Stopping unified processor');
+			if (unifiedProcessor) {
+				unifiedProcessor.stop();
+				unifiedProcessor = null;
 			}
-			audioProcessors.clear();
+			activeTracks.clear();
+			_sharedWebSocketUrl = null;
+			_sharedWebSocketReady = false;
 		}
 	});
 
-	async function handleRemoteTrack(participantId, participantName, track) {
-		console.log(`[audio-capture-mt] Handling remote track for ${participantId}`);
-
-		// Check if already processing this participant
-		if (audioProcessors.has(participantId)) {
-			console.warn(`[audio-capture-mt] Already processing ${participantId}, skipping`);
+	// Shared WebSocket connection manager
+	function ensureSharedWebSocketConnection() {
+		if (_sharedWebSocketUrl || _sharedWebSocketReady) {
+			// Already created or in progress
 			return;
 		}
 
-		// Create processor
-		const processor = new ParticipantAudioProcessor(
-			participantId,
-			participantName,
-			track,
-			DEFAULT_SAMPLE_RATE,
+		if (!_wsBaseUrl || !_meetingId) {
+			console.error(`[audio-capture-mt] Missing wsBaseUrl or meetingId for shared WebSocket`);
+			return;
+		}
+
+		// Build URL WITHOUT participant-specific info (shared connection)
+		const baseUrl = new URL(_wsBaseUrl);
+		baseUrl.searchParams.set('room', _meetingId);
+		baseUrl.searchParams.set('meetingId', _meetingId);
+		baseUrl.searchParams.set('source', 'browser');
+		baseUrl.searchParams.set('sampleRate', String(DEFAULT_SAMPLE_RATE));
+		baseUrl.searchParams.set('channels', '1');
+		
+		_sharedWebSocketUrl = baseUrl.toString();
+		console.log(`[audio-capture-mt] Opening SHARED WebSocket for all tracks:`, _sharedWebSocketUrl);
+
+		window.postMessage(
+			{
+				type: 'AUDIO_WS_OPEN',
+				url: _sharedWebSocketUrl,
+				tabId: _tabId,
+				participantId: null, // null = shared connection
+			},
+			'*',
 		);
+		
+		_sharedWebSocketReady = true;
+	}
 
-		audioProcessors.set(participantId, processor);
+	async function handleRemoteTrack(trackId, track) {
+		console.log(`[audio-capture-mt] Handling remote track ${trackId}`);
 
-		// Start processing
-		await processor.start();
+		// Check if this specific track is already being processed
+		if (activeTracks.has(trackId)) {
+			console.warn(`[audio-capture-mt] Track ${trackId} already being processed, skipping`);
+			return;
+		}
+
+		// Ensure unified processor is running
+		if (!unifiedProcessor || !unifiedProcessor.isRunning) {
+			console.warn('[audio-capture-mt] Unified processor not running, cannot add track');
+			return;
+		}
+
+		// Add track to unified processor
+		if (unifiedProcessor.addTrack(trackId, track)) {
+			activeTracks.set(trackId, { track });
+		}
 	}
 
 	// Expose for debugging
 	window.__audioCaptureMultiTrack = {
-		audioProcessors,
-		getActiveProcessors: () => Array.from(audioProcessors.entries()).map(([id, p]) => ({
-			participantId: id,
-			participantName: p.participantName,
-			isRunning: p.isRunning,
-			bytesSent: p.bytesSent,
-		})),
+		unifiedProcessor,
+		getActiveTracks: () => Array.from(activeTracks.keys()),
+		getStats: () => unifiedProcessor ? {
+			isRunning: unifiedProcessor.isRunning,
+			activeTracks: unifiedProcessor.sourceNodes.size,
+			bytesSent: unifiedProcessor.bytesSent,
+		} : null,
 	};
 
-	console.log('[audio-capture-mt] ✅ Multi-track audio capture ready');
+	console.log('[audio-capture-mt] ✅ Unified audio capture ready');
 })();
-

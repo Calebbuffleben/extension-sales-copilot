@@ -77,10 +77,11 @@
 		msg.className = 'msg';
 		msg.textContent = payload.message;
 		item.appendChild(msg);
-		if (Array.isArray(payload.tips) && payload.tips.length) {
+		const tipsArr = payload.tips ?? payload.metadata?.tips;
+		if (Array.isArray(tipsArr) && tipsArr.length) {
 			const tips = document.createElement('div');
 			tips.className = 'tips';
-			tips.textContent = `Dicas: ${payload.tips.join(' · ')}`;
+			tips.textContent = `Dicas: ${tipsArr.join(' · ')}`;
 			item.appendChild(tips);
 		}
 		const meta = document.createElement('div');

@@ -159,30 +159,23 @@ chrome.runtime.onConnect.addListener((port) => {
 			const participantId = msg.participantId;
 			const url = msg.url;
 			
-			// Multi-participant mode if participantId is provided
-			if (participantId) {
-				console.log('[background] AUDIO_WS_OPEN (multi-participant)', { tabId, participantId, url });
-				if (typeof tabId !== 'number' || !url || !participantId) {
-					console.error('[background] Invalid AUDIO_WS_OPEN params', { tabId, participantId, url });
+			// Shared connection mode (participantId is null) - ONE connection for all participants
+			if (participantId === null || participantId === undefined) {
+				console.log('[background] AUDIO_WS_OPEN (shared connection)', { tabId, url });
+				if (typeof tabId !== 'number' || !url) {
+					console.error('[background] Invalid AUDIO_WS_OPEN params for shared connection', { tabId, url });
 					return;
 				}
 				
-				// Get or create participant map for this tab
-				let participantMap = __wsByTabAndParticipant.get(tabId);
-				if (!participantMap) {
-					participantMap = new Map();
-					__wsByTabAndParticipant.set(tabId, participantMap);
-				}
-				
-				// Close existing connection for this participant if any
-				const existing = participantMap.get(participantId);
+				// Close existing shared connection if any
+				const existing = __wsByTab.get(tabId);
 				if (existing && existing.ws) {
 					try { existing.ws.close(1000, 'reconnect'); } catch (_e) {}
 				}
 				
-				// Create new connection state
+				// Create shared connection state
 				const state = { ws: null, url, ready: false, queue: [], _byteCounter: 0 };
-				console.log('[background] Creating WebSocket for participant', { tabId, participantId, url });
+				console.log('[background] Creating SHARED WebSocket connection', { tabId, url });
 				
 				try {
 					const ws = new WebSocket(url);
@@ -190,31 +183,35 @@ chrome.runtime.onConnect.addListener((port) => {
 					ws.onopen = () => {
 						state.ready = true;
 						startKeepAlive();
-						console.log('[background] ✅ WS CONNECTED (participant)', { tabId, participantId, queueLen: state.queue.length });
+						console.log('[background] ✅ WS CONNECTED (shared)', { tabId, queueLen: state.queue.length });
 						for (const buf of state.queue) {
 							try { ws.send(buf); } catch (_e) {}
 						}
 						state.queue = [];
 					};
 					ws.onerror = (err) => {
-						console.error('[background] ❌ WS ERROR (participant)', { tabId, participantId, error: err });
+						console.error('[background] ❌ WS ERROR (shared)', { tabId, error: err });
 					};
 					ws.onclose = (event) => {
-						console.log('[background] WS closed (participant)', { tabId, participantId, code: event.code });
-						participantMap.delete(participantId);
-						if (participantMap.size === 0) {
-							__wsByTabAndParticipant.delete(tabId);
-						}
+						console.log('[background] WS closed (shared)', { tabId, code: event.code });
+						__wsByTab.delete(tabId);
 						// Stop keep-alive if no more connections
 						if (__wsByTab.size === 0 && __wsByTabAndParticipant.size === 0) {
 							stopKeepAlive();
 						}
 					};
 					state.ws = ws;
-					participantMap.set(participantId, state);
+					__wsByTab.set(tabId, state);
 				} catch (e) {
-					console.error('[background] Failed to create WebSocket (participant)', { tabId, participantId, error: e });
+					console.error('[background] Failed to create shared WebSocket', { tabId, error: e });
 				}
+				return;
+			}
+			
+			// Legacy multi-participant mode (deprecated - should not be used)
+			if (participantId) {
+				console.warn('[background] AUDIO_WS_OPEN (multi-participant mode deprecated - use shared connection)', { tabId, participantId, url });
+				// Fallback to shared connection instead
 				return;
 			}
 			
@@ -261,7 +258,7 @@ chrome.runtime.onConnect.addListener((port) => {
 		}
 		if (type === 'AUDIO_WS_SEND') {
 			const tabId = msg.tabId;
-			const participantId = msg.participantId;
+			const participantId = msg.participantId; // Can be null for shared connection
 			let buffer = msg.buffer;
 			const byteLength = msg.byteLength || (buffer && buffer.byteLength) || 0;
 			
@@ -307,52 +304,35 @@ chrome.runtime.onConnect.addListener((port) => {
 					return;
 				}
 			}
-			// Multi-participant mode
-			if (participantId) {
-				const participantMap = __wsByTabAndParticipant.get(tabId);
-				const state = participantMap?.get(participantId);
-				if (!state || !state.ws) {
-					console.warn('[background] No WS state for participant', { tabId, participantId });
-					return;
-				}
-				state._byteCounter = (state._byteCounter || 0) + byteLength;
-				if (state.ready) {
-					try {
-						state.ws.send(buffer);
-					} catch (sendErr) {
-						console.error('[background] WS send failed (participant)', { tabId, participantId, error: sendErr.message });
-					}
-				} else {
-					state.queue.push(buffer.slice(0));
-				}
-				return;
-			}
 			
-			// Legacy single-stream mode
+			// Use shared connection (participantId can be null or provided for metadata)
 			const state = __wsByTab.get(tabId);
 			if (!state || !state.ws) {
-				console.warn('[background] No WS state found for AUDIO_WS_SEND', { 
+				console.warn('[background] No shared WS state found for AUDIO_WS_SEND', { 
 					tabId, 
 					hasState: !!state, 
 					hasWs: state?.ws ? true : false,
-					activeTabs: Array.from(__wsByTab.keys())
+					activeTabs: Array.from(__wsByTab.keys()),
+					participantId
 				});
 				return;
 			}
+			
 			state._byteCounter = (state._byteCounter || 0) + byteLength;
 			if (state._byteCounter >= 64000) {
-				console.log('[background] WS bytes sent', { tabId, sent: state._byteCounter });
+				console.log('[background] WS bytes sent', { tabId, sent: state._byteCounter, participantId });
 				state._byteCounter = 0;
 			}
+			
 			if (state.ready) {
 				try {
-					console.log('[background] WS send chunk', { tabId, len: byteLength, readyState: state.ws.readyState });
+					// Send buffer directly - participantId is handled by backend via query params or can be added as metadata if needed
 					state.ws.send(buffer);
 				} catch (sendErr) {
-					console.error('[background] WS send failed', { tabId, error: sendErr.message });
+					console.error('[background] WS send failed', { tabId, participantId, error: sendErr.message });
 				}
 			} else {
-				console.log('[background] WS queue chunk (not ready yet)', { tabId, len: byteLength, queueSize: state.queue.length });
+				console.log('[background] WS queue chunk (not ready yet)', { tabId, len: byteLength, queueSize: state.queue.length, participantId });
 				state.queue.push(buffer.slice(0));
 			}
 			return;
@@ -362,8 +342,15 @@ chrome.runtime.onConnect.addListener((port) => {
 			const participantId = msg.participantId;
 			if (typeof tabId !== 'number') return;
 			
+			// Close shared connection (participantId is null or undefined)
+			if (participantId === null || participantId === undefined) {
+				closeWsForTab(tabId);
+				return;
+			}
+			
+			// Legacy: Close specific participant connection (deprecated)
 			if (participantId) {
-				// Close specific participant connection
+				console.warn('[background] AUDIO_WS_CLOSE for specific participant deprecated - use shared connection');
 				const participantMap = __wsByTabAndParticipant.get(tabId);
 				if (participantMap) {
 					const state = participantMap.get(participantId);
@@ -375,9 +362,6 @@ chrome.runtime.onConnect.addListener((port) => {
 						__wsByTabAndParticipant.delete(tabId);
 					}
 				}
-			} else {
-				// Close all for tab (legacy)
-				closeWsForTab(tabId);
 			}
 			return;
 		}
@@ -513,13 +497,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 			let s = String(baseWs || '').trim();
 			const isSecurePage = /^https:\/\//i.test(String(tabUrl || ''));
 			if (!s) return s;
-			// If missing protocol, choose ws/wss based on page security
+			
+			// Check if it's localhost (development) - always use ws:// for localhost
+			const isLocalhost = /^localhost|^127\.0\.0\.1|^\[::1\]|^0\.0\.0\.0/i.test(s.replace(/^wss?:\/\//i, ''));
+			
+			// If missing protocol, choose ws/wss based on page security (unless localhost)
 			if (!/^[a-z]+:\/\//i.test(s)) {
-				s = (isSecurePage ? 'wss://' : 'ws://') + s;
+				s = (isLocalhost ? 'ws://' : (isSecurePage ? 'wss://' : 'ws://')) + s;
 			}
-			// If page is https, upgrade ws->wss to avoid mixed-content blocking
-			if (isSecurePage && /^ws:\/\//i.test(s)) {
+			// If page is https, upgrade ws->wss to avoid mixed-content blocking (unless localhost)
+			if (isSecurePage && /^ws:\/\//i.test(s) && !isLocalhost) {
 				s = s.replace(/^ws:\/\//i, 'wss://');
+			}
+			// Force ws:// for localhost even if it was converted to wss://
+			if (isLocalhost && /^wss:\/\//i.test(s)) {
+				s = s.replace(/^wss:\/\//i, 'ws://');
 			}
 			return s;
 		}
