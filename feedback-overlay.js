@@ -2,12 +2,29 @@
 	const MAX_ITEMS = 6;
 	const ITEM_TTL_MS = 15000;
 	const POLL_INTERVAL_MS = 2000; // fallback polling
+	const POLL_BASELINE_GRACE_MS = 5000;
 
 	let overlayRoot = null;
 	let listEl = null;
 	let socket = null;
 	let lastMetrics = null;
 	let pollTimer = null;
+	let disconnectFallbackTimer = null;
+	let connectErrorFallbackTimer = null;
+	/** Dedup by id (Socket.IO + HTTP); avoids duplicate when both paths fire. */
+	const seenEventIds = new Set();
+	let metricsBaselineDone = false;
+	let overlayMeetingId = null;
+	let pollingModeLogged = false;
+	let overlayStartedAtMs = 0;
+
+	function stopPolling() {
+		if (pollTimer) {
+			console.log('[feedback-overlay] stopPolling');
+			clearInterval(pollTimer);
+			pollTimer = null;
+		}
+	}
 
 	function ensureStyles() {
 		const styleId = '__meet_feedback_overlay_style__';
@@ -68,6 +85,71 @@
 		return 'sev-info';
 	}
 
+	function addPayloadIfNew(payload) {
+		if (!payload || typeof payload !== 'object') return;
+		const eventId = payload.id ? String(payload.id) : '';
+		if (eventId) {
+			if (seenEventIds.has(eventId)) return;
+			seenEventIds.add(eventId);
+		}
+		addItem(payload);
+	}
+
+	function normalizeRecentPayload(event) {
+		if (!event || typeof event !== 'object') return null;
+		const meta = event.metadata && typeof event.metadata === 'object' ? event.metadata : null;
+		const tips = meta && Array.isArray(meta.tips) ? meta.tips : [];
+		return {
+			id: event.id,
+			meetingId: event.meetingId,
+			participantId: event.participantId,
+			type: event.type,
+			severity: event.severity || 'info',
+			ts: event.ts || Date.now(),
+			createdAt: event.createdAt || null,
+			windowStart: event.windowStart,
+			windowEnd: event.windowEnd,
+			message: event.message || '',
+			tips,
+			metadata: meta || undefined
+		};
+	}
+
+	function getEventTimeMs(eventLike) {
+		if (!eventLike || typeof eventLike !== 'object') return 0;
+		const rawValue = eventLike.createdAt || eventLike.ts;
+		if (!rawValue) return 0;
+		const ms = new Date(rawValue).getTime();
+		return Number.isFinite(ms) ? ms : 0;
+	}
+
+	function shouldRenderRecentOnBaseline(eventLike) {
+		if (!overlayStartedAtMs) return false;
+		const eventTimeMs = getEventTimeMs(eventLike);
+		if (!eventTimeMs) return false;
+		return eventTimeMs >= overlayStartedAtMs - POLL_BASELINE_GRACE_MS;
+	}
+
+	function replayRecent(recent) {
+		if (!Array.isArray(recent) || recent.length === 0) return;
+		const sorted = [...recent].sort(
+			(a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime()
+		);
+		for (const event of sorted) {
+			const payload = normalizeRecentPayload(event);
+			if (!payload) continue;
+			addPayloadIfNew(payload);
+		}
+	}
+
+	function emitJoinRoom(meetingId) {
+		if (!socket) return;
+		console.log('[feedback-overlay] emit join-room', { meetingId });
+		try {
+			socket.emit('join-room', `feedback:${meetingId}`);
+		} catch (_e) {}
+	}
+
 	function addItem(payload) {
 		ensureStyles();
 		ensureOverlay();
@@ -104,48 +186,167 @@
 
 	function connectSocket(httpBase, meetingId) {
 		if (!window.io || typeof window.io !== 'function') {
+			console.log('[feedback-overlay] window.io not available -> startPolling', {
+				meetingId,
+			});
 			startPolling(httpBase, meetingId);
 			return;
 		}
 		try {
+			if (socket) {
+				try {
+					socket.removeAllListeners();
+					socket.disconnect();
+				} catch (_e) {}
+				socket = null;
+			}
+			if (connectErrorFallbackTimer) {
+				clearTimeout(connectErrorFallbackTimer);
+				connectErrorFallbackTimer = null;
+			}
 			socket = window.io(httpBase, {
 				transports: ['websocket'],
-				withCredentials: true
+				// Avoid credentialed CORS unless the API uses cookies; '*' + credentials breaks some handshakes.
+				withCredentials: false,
+				reconnection: true,
+				reconnectionAttempts: 10,
+				reconnectionDelay: 1000
 			});
 		} catch (_e) {
+			console.log('[feedback-overlay] socket.io init failed -> startPolling', {
+				meetingId,
+			});
 			startPolling(httpBase, meetingId);
 			return;
 		}
+
 		socket.on('connect', () => {
-			try {
-				socket.emit('join-room', `feedback:${meetingId}`);
-			} catch (_e) {}
+			console.log('[feedback-overlay] socket connect', { meetingId });
+			if (disconnectFallbackTimer) {
+				clearTimeout(disconnectFallbackTimer);
+				disconnectFallbackTimer = null;
+			}
+			if (connectErrorFallbackTimer) {
+				clearTimeout(connectErrorFallbackTimer);
+				connectErrorFallbackTimer = null;
+			}
+			emitJoinRoom(meetingId);
+		});
+		socket.on('room-joined', (payload) => {
+			const joinedRoom = payload && payload.room ? String(payload.room) : '';
+			console.log('[feedback-overlay] room-joined', {
+				meetingId,
+				room: joinedRoom,
+				recentCount: Array.isArray(payload?.recent) ? payload.recent.length : 0,
+			});
+			metricsBaselineDone = true;
+			replayRecent(payload?.recent);
+			stopPolling();
 		});
 		socket.on('feedback', (payload) => {
-			if (payload && typeof payload === 'object') {
-				addItem(payload);
-			}
+			addPayloadIfNew(payload);
 		});
 		socket.on('disconnect', () => {
-			// fallback to polling after a short delay
-			setTimeout(() => {
+			console.log('[feedback-overlay] socket disconnect', { meetingId });
+			if (disconnectFallbackTimer) {
+				clearTimeout(disconnectFallbackTimer);
+			}
+			// Fallback only if still disconnected after delay (avoids polling after a quick reconnect).
+			disconnectFallbackTimer = setTimeout(() => {
+				disconnectFallbackTimer = null;
+				try {
+					if (socket && socket.connected) return;
+				} catch (_e) {}
 				startPolling(httpBase, meetingId);
 			}, 1000);
 		});
-		socket.on('connect_error', () => {
-			startPolling(httpBase, meetingId);
+		socket.on('connect_error', (err) => {
+			console.log('[feedback-overlay] socket connect_error', {
+				meetingId,
+				message: err && err.message ? err.message : String(err),
+			});
+			// Immediate polling races with Socket.IO retries; wait before fallback so a successful connect can clear this path.
+			if (!connectErrorFallbackTimer) {
+				connectErrorFallbackTimer = setTimeout(() => {
+					connectErrorFallbackTimer = null;
+					try {
+						if (socket && socket.connected) return;
+					} catch (_e) {}
+					startPolling(httpBase, meetingId);
+				}, 2500);
+			}
 		});
+
+		// Register listeners before this fast-path join, otherwise the immediate server
+		// response can be missed on already-connected transports.
+		try {
+			if (socket && socket.connected) {
+				console.log('[feedback-overlay] socket already connected (fast path) -> join-room', {
+					meetingId,
+				});
+				emitJoinRoom(meetingId);
+			}
+		} catch (_e) {}
 	}
 
 	function startPolling(httpBase, meetingId) {
 		if (pollTimer) return;
+		console.log('[feedback-overlay] startPolling', { meetingId });
 		const url = `${httpBase}/feedback/metrics/${encodeURIComponent(meetingId)}`;
 		const poll = async () => {
 			try {
 				const res = await fetch(url, { credentials: 'include' });
 				if (!res.ok) throw new Error(`HTTP ${res.status}`);
 				const data = await res.json();
-				// Compare counts and synthesize informational items when counters change
+				if (!pollingModeLogged) {
+					if (Array.isArray(data.recent) && data.recent.length > 0) {
+						console.log('[feedback-overlay] polling mode=recent', {
+							seedCount: data.recent.length,
+						});
+					} else {
+						console.log('[feedback-overlay] polling mode=legacy-counts', {
+							hasCounts: data && typeof data.counts === 'object',
+							countKeys: data && data.counts ? Object.keys(data.counts).slice(0, 6) : [],
+						});
+					}
+					pollingModeLogged = true;
+				}
+				// Prefer server-backed `recent` rows (full message + tips) — works across Railway replicas.
+				if (Array.isArray(data.recent) && data.recent.length > 0) {
+					const sorted = [...data.recent].sort(
+						(a, b) => getEventTimeMs(a) - getEventTimeMs(b)
+					);
+					if (!metricsBaselineDone) {
+						let renderedOnBaseline = 0;
+						for (const e of sorted) {
+							if (!shouldRenderRecentOnBaseline(e)) continue;
+							const payload = normalizeRecentPayload(e);
+							if (!payload) continue;
+							addPayloadIfNew(payload);
+							renderedOnBaseline += 1;
+						}
+						for (const e of data.recent) {
+							if (e && e.id && !seenEventIds.has(String(e.id))) {
+								seenEventIds.add(String(e.id));
+							}
+						}
+						if (renderedOnBaseline > 0) {
+							console.log('[feedback-overlay] polling baseline rendered recent', {
+								renderedCount: renderedOnBaseline,
+							});
+						}
+						metricsBaselineDone = true;
+					} else {
+						for (const e of sorted) {
+							const payload = normalizeRecentPayload(e);
+							if (!payload) continue;
+							addPayloadIfNew(payload);
+						}
+					}
+					lastMetrics = data;
+					return;
+				}
+				// Legacy: count deltas only (no full message)
 				if (data && data.counts && typeof data.counts === 'object') {
 					if (!lastMetrics) {
 						lastMetrics = data;
@@ -178,6 +379,16 @@
 		const meetingId = String(payload?.meetingId || '').trim();
 		const httpBase = String(payload?.feedbackHttpBase || '').trim();
 		if (!meetingId || !httpBase) return;
+		if (overlayMeetingId !== meetingId) {
+			overlayMeetingId = meetingId;
+			seenEventIds.clear();
+			metricsBaselineDone = false;
+			pollingModeLogged = false;
+			lastMetrics = null;
+			overlayStartedAtMs = Date.now();
+		} else if (!overlayStartedAtMs) {
+			overlayStartedAtMs = Date.now();
+		}
 		connectSocket(httpBase, meetingId);
 	}
 
